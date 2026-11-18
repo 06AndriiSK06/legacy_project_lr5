@@ -126,41 +126,27 @@ def get_top_products(data, n=10, sort_by="revenue"):
     
     return lst[:n]
 
-def calculate_growth(current, previous):
-    """growth rate calculation"""
+def calculate_growth(current, previous, period=None):
+    """Unified growth rate calculation with backward-compatible period aliases."""
+    _ = period
     if previous == 0:
         if current > 0:
             return 100.0
         return 0.0
-    g = ((current - previous) / previous) * 100
-    return round(g, 2)
+    growth = ((current - previous) / previous) * 100
+    return round(growth, 2)
 
 def calculate_growth_yoy(current, previous):
-    """year over year growth - same as above but different name"""
-    if previous == 0:
-        if current > 0:
-            return 100.0
-        return 0.0
-    g = ((current - previous) / previous) * 100
-    return round(g, 2)
+    """Year-over-year growth wrapper."""
+    return calculate_growth(current, previous, period="yoy")
 
 def calculate_growth_mom(current, previous):
-    """month over month growth - same as above"""
-    if previous == 0:
-        if current > 0:
-            return 100.0
-        return 0.0
-    g = ((current - previous) / previous) * 100
-    return round(g, 2)
+    """Month-over-month growth wrapper."""
+    return calculate_growth(current, previous, period="mom")
 
 def calculate_growth_wow(current, previous):
-    """week over week growth - yes, same formula again"""
-    if previous == 0:
-        if current > 0:
-            return 100.0
-        return 0.0
-    g = ((current - previous) / previous) * 100
-    return round(g, 2)
+    """Week-over-week growth wrapper."""
+    return calculate_growth(current, previous, period="wow")
 
 def get_conversion_rate(visitors, orders):
     if visitors == 0:
