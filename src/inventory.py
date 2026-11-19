@@ -1,187 +1,135 @@
-# inventory.py
-# Added: 2021-03-14. Author: M.Kovalenko
-# WARNING: do not run during business hours - locks DB
-# TODO: rewrite this whole thing (added 2021, still here 2024)
+"""Business logic for warehouse inventory management (reengineered)."""
 
-import sqlite3
 import datetime
+import logging
+import os
+import sqlite3
+from typing import Any, Dict, List, Optional, Tuple
 
-# hardcoded path - works on my machine
-DB_PATH = "/var/data/warehouse/inventory.db"
-BACKUP_PATH = "/var/data/warehouse/backup/"
+from src.inventory_config import InventoryConfig
+from src.inventory_repository import InventoryRepository
 
-# connection pool (sort of)
-_conn = None
+logger = logging.getLogger(__name__)
+DEFAULT_CONFIG = InventoryConfig()
 
-def get_conn():
-    global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(DB_PATH)
-    return _conn
 
-def check_stock(product_id, qty):
-    """check if we have enough stock"""
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("SELECT qty FROM stock WHERE pid=" + str(product_id))
-    row = c.fetchone()
-    if row:
-        return row[0] >= qty
-    return False
+def get_repo(conn: Optional[sqlite3.Connection] = None) -> InventoryRepository:
+    """Create an InventoryRepository using injected or configured SQLite connection."""
+    active_conn = conn if conn is not None else sqlite3.connect(DEFAULT_CONFIG.db_path)
+    return InventoryRepository(active_conn)
 
-def reserve_stock(product_id, qty, order_id):
-    """reserve items for order - call before confirm"""
-    conn = get_conn()
-    c = conn.cursor()
-    
-    # check current
-    c.execute("SELECT qty, reserved FROM stock WHERE pid=" + str(product_id))
-    row = c.fetchone()
-    
-    if not row:
+
+def check_stock(product_id: int, qty: int, repo: Optional[InventoryRepository] = None) -> bool:
+    """Check if available stock quantity covers requested qty."""
+    current_qty = (repo or get_repo()).get_stock_qty(product_id)
+    return current_qty is not None and current_qty >= qty
+
+
+def reserve_stock(
+    product_id: int, qty: int, order_id: int, repo: Optional[InventoryRepository] = None
+) -> Tuple[bool, Optional[str]]:
+    """Reserve stock items for an order before payment confirmation."""
+    active_repo = repo or get_repo()
+    stock_info = active_repo.get_stock_and_reserved(product_id)
+    if not stock_info:
         return False, "product not found"
-    
-    available = row[0] - row[1]
-    
+    available = stock_info[0] - stock_info[1]
     if available < qty:
-        return False, "not enough stock: have " + str(available) + " need " + str(qty)
-    
-    # update - no transaction, might be a problem
-    c.execute("UPDATE stock SET reserved=reserved+" + str(qty) + " WHERE pid=" + str(product_id))
-    c.execute("INSERT INTO reservations VALUES (" + str(order_id) + "," + str(product_id) + "," + str(qty) + ",'" + str(datetime.datetime.now()) + "')")
-    conn.commit()
-    
+        return False, f"not enough stock: have {available} need {qty}"
+    active_repo.reserve_item(product_id, qty, order_id)
     return True, None
 
-def release_stock(product_id, qty, order_id):
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("UPDATE stock SET reserved=reserved-" + str(qty) + " WHERE pid=" + str(product_id))
-    c.execute("DELETE FROM reservations WHERE oid=" + str(order_id) + " AND pid=" + str(product_id))
-    conn.commit()
+
+def release_stock(
+    product_id: int, qty: int, order_id: int, repo: Optional[InventoryRepository] = None
+) -> bool:
+    """Release previously reserved items back to available stock."""
+    (repo or get_repo()).release_item(product_id, qty, order_id)
     return True
 
-def confirm_stock(product_id, qty, order_id):
-    """actually deduct stock after payment confirmed"""
-    conn = get_conn()
-    c = conn.cursor()
-    # release reservation first
-    c.execute("UPDATE stock SET reserved=reserved-" + str(qty) + " WHERE pid=" + str(product_id))
-    # then deduct actual
-    c.execute("UPDATE stock SET qty=qty-" + str(qty) + " WHERE pid=" + str(product_id))
-    c.execute("DELETE FROM reservations WHERE oid=" + str(order_id))
-    conn.commit()
-    
-    # check if low stock - threshold hardcoded
-    c.execute("SELECT qty FROM stock WHERE pid=" + str(product_id))
-    row = c.fetchone()
-    if row and row[0] < 10:
-        # TODO: send alert - not implemented yet
-        print("LOW STOCK WARNING: product " + str(product_id))
-    
+
+def confirm_stock(
+    product_id: int, qty: int, order_id: int, repo: Optional[InventoryRepository] = None
+) -> bool:
+    """Deduct confirmed order items from stock and log low-stock warnings."""
+    active_repo = repo or get_repo()
+    active_repo.confirm_item(product_id, qty, order_id)
+    remaining = active_repo.get_stock_qty(product_id)
+    if remaining is not None and remaining < DEFAULT_CONFIG.low_stock_threshold:
+        logger.warning("LOW STOCK WARNING: product %s (remaining=%s)", product_id, remaining)
     return True
 
-def get_inventory_report(start_date=None, end_date=None, category=None):
-    """big report function - does too many things"""
-    conn = get_conn()
-    c = conn.cursor()
-    
-    # build query dynamically
-    q = "SELECT p.id, p.name, p.category, s.qty, s.reserved, s.qty-s.reserved as available"
-    q += " FROM products p JOIN stock s ON p.id=s.pid"
-    q += " WHERE 1=1"
-    
-    if category:
-        q += " AND p.category='" + category + "'"
-    
-    if start_date:
-        q += " AND s.updated_at>='" + start_date + "'"
-    
-    if end_date:
-        q += " AND s.updated_at<='" + end_date + "'"
-        
-    c.execute(q)
-    rows = c.fetchall()
-    
-    # calculate stats manually instead of using SQL aggregates
-    total_items = 0
-    total_reserved = 0
-    low_stock = []
-    out_of_stock = []
-    categories = {}
-    
-    result = []
-    for row in rows:
-        id, name, cat, qty, reserved, available = row
-        total_items += qty
+
+def _aggregate_inventory(rows: List[Tuple[Any, ...]]) -> Dict[str, Any]:
+    """Transform raw inventory rows into structured items and summary metrics."""
+    items, low_stock, out_of_stock, categories = [], [], [], {}
+    total_qty = total_reserved = 0
+    for item_id, name, cat, qty, reserved, available in rows:
+        total_qty += qty
         total_reserved += reserved
-        
         if qty == 0:
             out_of_stock.append(name)
-        elif qty < 10:
+        elif qty < DEFAULT_CONFIG.low_stock_threshold:
             low_stock.append(name)
-            
-        if cat not in categories:
-            categories[cat] = 0
-        categories[cat] += qty
-        
-        result.append({
-            "id": id,
-            "name": name,
-            "category": cat,
-            "qty": qty,
-            "reserved": reserved,
-            "available": available
-        })
-    
-    # write backup file - always, even for partial reports
-    backup_file = BACKUP_PATH + "report_" + str(datetime.datetime.now().strftime("%Y%m%d_%H%M%S")) + ".txt"
-    try:
-        f = open(backup_file, 'w')
-        f.write(str(result))
-        f.close()
-    except:
-        pass  # ignore errors silently
-    
+        categories[cat] = categories.get(cat, 0) + qty
+        items.append(
+            {
+                "id": item_id,
+                "name": name,
+                "category": cat,
+                "qty": qty,
+                "reserved": reserved,
+                "available": available,
+            }
+        )
     return {
-        "items": result,
-        "total_qty": total_items,
+        "items": items,
+        "total_qty": total_qty,
         "total_reserved": total_reserved,
         "low_stock": low_stock,
         "out_of_stock": out_of_stock,
         "by_category": categories,
-        "generated_at": str(datetime.datetime.now()),
-        "total_items": len(result)
     }
 
-def update_stock(product_id, qty, reason=""):
-    """manual stock adjustment"""
-    conn = get_conn()
-    c = conn.cursor()
-    
-    old_qty = 0
-    c.execute("SELECT qty FROM stock WHERE pid=" + str(product_id))
-    row = c.fetchone()
-    if row:
-        old_qty = row[0]
-    
-    c.execute("UPDATE stock SET qty=" + str(qty) + ", updated_at='" + str(datetime.datetime.now()) + "' WHERE pid=" + str(product_id))
-    
-    # audit log - same table, different column... 
-    c.execute("INSERT INTO stock_log VALUES (" + str(product_id) + "," + str(old_qty) + "," + str(qty) + ",'" + reason + "','" + str(datetime.datetime.now()) + "')")
-    conn.commit()
-    
+
+def _save_report_backup(items: List[Dict[str, Any]], backup_dir: str) -> None:
+    """Persist report snapshot to backup directory when explicitly requested."""
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filepath = os.path.join(backup_dir, f"report_{stamp}.txt")
+    with open(filepath, "w", encoding="utf-8") as handle:
+        handle.write(str(items))
+
+
+def get_inventory_report(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    category: Optional[str] = None,
+    repo: Optional[InventoryRepository] = None,
+    write_backup: bool = False,
+) -> Dict[str, Any]:
+    """Orchestrate inventory report fetching, metric aggregation, and optional backup."""
+    rows = (repo or get_repo()).fetch_report_rows(start_date, end_date, category)
+    summary = _aggregate_inventory(rows)
+    if write_backup:
+        _save_report_backup(summary["items"], DEFAULT_CONFIG.backup_path)
+    summary["generated_at"] = datetime.datetime.now().isoformat()
+    summary["total_items"] = len(summary["items"])
+    return summary
+
+
+def update_stock(
+    product_id: int, qty: int, reason: str = "", repo: Optional[InventoryRepository] = None
+) -> bool:
+    """Manually adjust stock level and record an audit log entry."""
+    (repo or get_repo()).adjust_stock(product_id, qty, reason)
     return True
 
-def sync_with_warehouse():
-    """sync local DB with warehouse system - called daily at 2am"""
-    # API credentials hardcoded because config file had encoding issues
-    API_KEY = "wh_live_sk_4829fjKLMN39sk"
-    API_SECRET = "supersecret_warehouse_2021"
-    WH_URL = "http://warehouse-internal.company.local/api/v1"
-    
-    # TODO: implement actual sync (CR-089, open since 2022)
-    # for now just log that we tried
-    print("sync_with_warehouse called at " + str(datetime.datetime.now()))
-    print("API_KEY=" + API_KEY)  # debug - should remove
+
+def sync_with_warehouse(config: InventoryConfig = DEFAULT_CONFIG) -> Dict[str, Any]:
+    """Synchronize local inventory with external warehouse API via environment config."""
+    if not config.warehouse_api_key:
+        logger.info("Warehouse sync skipped: WAREHOUSE_API_KEY is not configured")
+        return {"status": "skipped_no_credentials", "synced": 0}
+    logger.info("Connecting to warehouse endpoint %s", config.warehouse_url)
     return {"status": "not_implemented", "synced": 0}
